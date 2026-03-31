@@ -1,0 +1,231 @@
+import { NextResponse } from "next/server";
+import { createTask, findCase, getCaseOfficer, parseGhlDate } from "@/lib/irs-logics";
+import { fetchAppointmentFromGhl } from "@/lib/ghl";
+import { getNextOfficer, insertTaskLog } from "@/lib/supabase";
+import { buildTaskDetails, normalizeWebhookPayload } from "@/lib/webhook";
+import { buildPendingEntry, insertPendingTask } from "@/lib/pending";
+import { isDuplicateTask } from "@/lib/dedup";
+
+export const dynamic = "force-dynamic";
+
+async function safeInsertTaskLog(entry) {
+  try {
+    await insertTaskLog(entry);
+  } catch (error) {
+    console.error("task_logs insert failed:", error);
+  }
+}
+
+export async function POST(request) {
+  let normalized = {};
+  let caseId = null;
+  let lookupMethod = null;
+  let officer = null;
+  let assignmentMethod = null;
+  let taskId = null;
+  let taskDetails = null;
+
+  try {
+    const body = await request.json();
+    normalized = normalizeWebhookPayload(body);
+
+    if (!normalized.email && !normalized.phone) {
+      const errorMessage = "Missing email and phone - cannot find case";
+
+      await safeInsertTaskLog({
+        ...normalized,
+        status: "error",
+        errorMessage,
+      });
+
+      return NextResponse.json({ error: errorMessage }, { status: 400 });
+    }
+
+    let lookup = await findCase(normalized.email, normalized.phone);
+    caseId = lookup.caseId;
+    lookupMethod = lookup.lookupMethod;
+
+    // Retry once after delay — handles race condition where the case is still
+    // being created in IRS Logics when the GHL webhook fires simultaneously.
+    if (!caseId) {
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      lookup = await findCase(normalized.email, normalized.phone);
+      caseId = lookup.caseId;
+      lookupMethod = lookup.lookupMethod;
+    }
+
+    if (!caseId) {
+      const errorMessage = `No case found in IRS Logics for email: ${normalized.email || "-"}, phone: ${normalized.phone || "-"}`;
+
+      await safeInsertTaskLog({
+        ...normalized,
+        lookupMethod,
+        status: "case_not_found",
+        errorMessage,
+      });
+
+      return NextResponse.json(
+        {
+          error: "Case not found",
+          message: errorMessage,
+        },
+        { status: 404 }
+      );
+    }
+
+    // If the webhook payload is missing appointment times, fetch from GHL API
+    if (!normalized.appointmentStart) {
+      console.log("Appointment time missing from webhook — fetching from GHL API");
+      const ghlData = await fetchAppointmentFromGhl(
+        normalized.email,
+        normalized.phone
+      );
+
+      if (ghlData.appointmentStart) {
+        normalized.appointmentStart = ghlData.appointmentStart;
+      }
+      if (ghlData.appointmentEnd) {
+        normalized.appointmentEnd = ghlData.appointmentEnd;
+      }
+      if (ghlData.appointmentTitle && !normalized.appointmentTitle) {
+        normalized.appointmentTitle = ghlData.appointmentTitle;
+      }
+      if (ghlData.calendarName && !normalized.calendarName) {
+        normalized.calendarName = ghlData.calendarName;
+      }
+    }
+
+    // GATE: If we STILL don't have appointment data after GHL fallback,
+    // queue to pending_tasks instead of creating a task with fake times
+    if (!normalized.appointmentStart) {
+      console.log("Still no appointment data after GHL fallback — queuing to pending_tasks");
+
+      const pendingEntry = buildPendingEntry(normalized, { caseId, lookupMethod });
+      await insertPendingTask(pendingEntry);
+
+      await safeInsertTaskLog({
+        ...normalized,
+        caseId,
+        lookupMethod,
+        status: "pending_appointment",
+        errorMessage: "Appointment data missing — queued for retry via cron",
+      });
+
+      return NextResponse.json({
+        success: true,
+        queued: true,
+        caseId,
+        message: "Appointment data missing — queued for processing. Task will be created when appointment details are available.",
+      });
+    }
+
+    // DEDUP: Check if we already created a task for this case + appointment time
+    const parsedStartForDedup = parseGhlDate(normalized.appointmentStart) || normalized.appointmentStart;
+    if (await isDuplicateTask(caseId, parsedStartForDedup)) {
+      console.log(`Duplicate task detected for case ${caseId} at ${parsedStartForDedup} — skipping`);
+      return NextResponse.json({
+        success: true,
+        duplicate: true,
+        caseId,
+        message: "Task already exists for this appointment",
+      });
+    }
+
+    // Priority: use the case's assigned officer first, fall back to round-robin
+    const caseOfficer = await getCaseOfficer(caseId);
+    if (caseOfficer) {
+      officer = caseOfficer;
+      assignmentMethod = "case_officer";
+    } else {
+      const assignment = await getNextOfficer();
+      officer = assignment.officer;
+      assignmentMethod = "round_robin";
+    }
+
+    taskDetails = buildTaskDetails(normalized);
+
+    const taskPayload = {
+      CaseID: caseId,
+      Subject: taskDetails.subject,
+      TaskType: 1,
+      UserID: [officer.userId],
+      PriorityID: 1,
+      StatusID: 0,
+      DueDate: taskDetails.dueDate,
+      Reminder: taskDetails.reminder,
+      ...(taskDetails.endDate ? { EndDate: taskDetails.endDate } : {}),
+      ...(taskDetails.comments ? { Comments: taskDetails.comments } : {}),
+    };
+
+    const taskResult = await createTask(taskPayload);
+    taskId = taskResult.taskId;
+
+    if (!taskResult.ok) {
+      await safeInsertTaskLog({
+        ...normalized,
+        caseId,
+        lookupMethod,
+        taskId,
+        taskSubject: taskDetails.subject,
+        officerName: officer.name,
+        officerUserId: officer.userId,
+        assignmentMethod,
+        appointmentStart: taskDetails.dueDate,
+        appointmentEnd: taskDetails.endDate,
+        status: "task_failed",
+        errorMessage: taskResult.errorMessage,
+      });
+
+      return NextResponse.json(
+        {
+          error: "Failed to create task in IRS Logics",
+          caseId,
+          details: taskResult.result,
+        },
+        { status: taskResult.status || 500 }
+      );
+    }
+
+    await safeInsertTaskLog({
+      ...normalized,
+      caseId,
+      lookupMethod,
+      taskId,
+      taskSubject: taskDetails.subject,
+      officerName: officer.name,
+      officerUserId: officer.userId,
+      assignmentMethod,
+      appointmentStart: taskDetails.dueDate,
+      appointmentEnd: taskDetails.endDate,
+      status: "success",
+    });
+
+    return NextResponse.json({
+      success: true,
+      caseId,
+      taskId,
+      assignedTo: officer.name,
+      assignmentMethod,
+      message: taskResult.result?.Message || taskResult.result?.message || null,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+
+    await safeInsertTaskLog({
+      ...normalized,
+      caseId,
+      lookupMethod,
+      taskId,
+      taskSubject: taskDetails?.subject,
+      officerName: officer?.name,
+      officerUserId: officer?.userId,
+      assignmentMethod,
+      appointmentStart: taskDetails?.dueDate,
+      appointmentEnd: taskDetails?.endDate,
+      status: "error",
+      errorMessage,
+    });
+
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+  }
+}
