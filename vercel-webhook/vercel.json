@@ -1,3 +1,10 @@
 {
-  "version": 2
+  "version": 2,
+  "framework": "nextjs",
+  "crons": [
+    {
+      "path": "/api/cron/process-pending",
+      "schedule": "*/5 * * * *"
+    }
+  ]
 }
