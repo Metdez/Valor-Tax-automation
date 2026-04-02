@@ -1,13 +1,24 @@
 // vercel-webhook/app/api/cron/process-pending/route.js
 import { NextResponse } from "next/server";
-import { fetchAppointmentFromGhl } from "@/lib/ghl";
-import { createTask, findCase, getCaseOfficer, parseGhlDate } from "@/lib/irs-logics";
+import { fetchAppointmentFromGhl, findGhlContactByName, enrichContactInfo } from "@/lib/ghl";
+import { fetchAppointmentViaAgent, findContactInfoViaAgent } from "@/lib/agent";
+import {
+  createTask,
+  createCase,
+  findCase,
+  findCaseExhaustive,
+  getCaseOfficer,
+  parseGhlDate,
+} from "@/lib/irs-logics";
 import { getNextOfficer, insertTaskLog } from "@/lib/supabase";
 import { buildTaskDetails } from "@/lib/webhook";
 import {
   getPendingTasks,
   completePendingTask,
   incrementRetry,
+  updatePendingTaskContactInfo,
+  MAX_CASE_NOT_FOUND_RETRIES,
+  MAX_TASK_FAILED_RETRIES,
 } from "@/lib/pending";
 import { isDuplicateTask } from "@/lib/dedup";
 import {
@@ -25,37 +36,277 @@ function isAuthorized(request) {
   return false;
 }
 
+/**
+ * Escalating case search tied to retry_count:
+ *   retry 0 (retry 1): basic findCase(email, phone)
+ *   retry 1 (retry 2): + alt phone formats + GHL contact enrichment
+ *   retry 2 (retry 3): + AI agent fuzzy match
+ *   retry 3 (retry 4): auto-create the case
+ *
+ * Returns { caseId, lookupMethod, officer?, method? } or null (if retried/incremented).
+ */
+async function escalatingCaseSearch(row, results) {
+  const retryNum = row.retry_count;
+
+  // --- RETRY 1: basic email + phone ---
+  const basic = await findCase(row.email, row.phone);
+  if (basic.caseId) {
+    return { caseId: basic.caseId, lookupMethod: basic.lookupMethod };
+  }
+
+  // --- RETRY 2+: alt phone formats + GHL enrichment ---
+  if (retryNum >= 1) {
+    let extraEmails = [];
+    let extraPhones = [];
+
+    console.log(`Pending #${row.id}: retry ${retryNum + 1} — enriching contact info from GHL`);
+    const enriched = await enrichContactInfo(row.email, row.phone);
+    extraEmails = enriched.emails || [];
+    extraPhones = enriched.phones || [];
+
+    if (enriched.emails?.length || enriched.phones?.length) {
+      const newEmail = enriched.emails?.find((e) => e && e !== row.email);
+      const newPhone = enriched.phones?.find((p) => p && p !== row.phone);
+      if (newEmail || newPhone) {
+        await updatePendingTaskContactInfo(row.id, newEmail || row.email, newPhone || row.phone);
+        if (newEmail) row.email = newEmail;
+        if (newPhone) row.phone = newPhone;
+      }
+    }
+
+    const exhaustive = await findCaseExhaustive(row.email, row.phone, extraEmails, extraPhones);
+    if (exhaustive.caseId) {
+      return { caseId: exhaustive.caseId, lookupMethod: exhaustive.lookupMethod };
+    }
+  }
+
+  // --- RETRY 3+: AI agent fuzzy match ---
+  if (retryNum >= 2) {
+    console.log(`Pending #${row.id}: retry ${retryNum + 1} — trying AI agent for contact info`);
+    const agentInfo = await findContactInfoViaAgent(
+      row.email, row.phone, row.first_name, row.last_name
+    );
+
+    if (agentInfo.emails?.length || agentInfo.phones?.length) {
+      const agentExhaustive = await findCaseExhaustive(
+        row.email, row.phone, agentInfo.emails, agentInfo.phones
+      );
+      if (agentExhaustive.caseId) {
+        return { caseId: agentExhaustive.caseId, lookupMethod: agentExhaustive.lookupMethod };
+      }
+    }
+  }
+
+  // --- RETRY 4: auto-create ---
+  if (row.reason === "case_not_found" && retryNum + 1 >= MAX_CASE_NOT_FOUND_RETRIES) {
+    console.log(`Pending #${row.id}: all searches exhausted, auto-creating case for ${row.email || row.phone}`);
+    const assignment = await getNextOfficer();
+    const officer = assignment.officer;
+
+    const createResult = await createCase({
+      firstName: row.first_name,
+      lastName: row.last_name,
+      email: row.email,
+      phone: row.phone,
+      officerName: officer.name,
+    });
+
+    if (!createResult.ok || !createResult.caseId) {
+      await incrementRetry(row.id, row.retry_count,
+        `Auto-create case failed: ${createResult.errorMessage}`, row.reason);
+      results.failed++;
+      return null;
+    }
+
+    results.autoCreated++;
+    console.log(`Pending #${row.id}: case auto-created with CaseID ${createResult.caseId}, officer ${officer.name}`);
+    return {
+      caseId: createResult.caseId,
+      lookupMethod: "auto_created",
+      officer,
+      method: "auto_created",
+    };
+  }
+
+  // Not yet exhausted retries
+  await incrementRetry(row.id, row.retry_count, "Case still not found in IRS Logics", row.reason);
+  results.retried++;
+  return null;
+}
+
+/**
+ * Handle task_failed rows: retry task creation, rotating officers on repeated failures.
+ */
+async function processTaskFailed(row, results) {
+  const caseId = row.case_id;
+
+  const ghlData = await fetchAppointmentFromGhl(row.email, row.phone);
+  if (!ghlData.appointmentStart) {
+    const agentData = await fetchAppointmentViaAgent(
+      row.email, row.phone,
+      [row.first_name, row.last_name].filter(Boolean).join(" ") || null,
+      null
+    );
+    if (agentData.appointmentStart) Object.assign(ghlData, agentData);
+  }
+
+  const parsedStart = parseGhlDate(ghlData.appointmentStart) || ghlData.appointmentStart;
+  if (parsedStart && await isDuplicateTask(caseId, parsedStart)) {
+    await completePendingTask(row.id);
+    results.completed++;
+    console.log(`Pending #${row.id}: duplicate task already exists, marking completed`);
+    return;
+  }
+
+  let officer, assignmentMethod;
+  const caseOfficer = await getCaseOfficer(caseId);
+
+  if (row.retry_count === 0 && caseOfficer) {
+    officer = caseOfficer;
+    assignmentMethod = "case_officer";
+  } else {
+    const assignment = await getNextOfficer();
+    officer = assignment.officer;
+    assignmentMethod = "round_robin";
+  }
+
+  const normalized = {
+    firstName: row.first_name,
+    lastName: row.last_name,
+    email: row.email,
+    phone: row.phone,
+    appointmentTitle: ghlData.appointmentTitle || row.appointment_title,
+    appointmentStart: ghlData.appointmentStart,
+    appointmentEnd: ghlData.appointmentEnd,
+    calendarName: ghlData.calendarName || row.calendar_name,
+    aiSummary: row.ai_summary,
+    aiTranscript: row.ai_transcript,
+  };
+
+  const taskDetails = buildTaskDetails(normalized);
+
+  const taskPayload = {
+    CaseID: caseId,
+    Subject: taskDetails.subject,
+    TaskType: 1,
+    UserID: [officer.userId],
+    PriorityID: 1,
+    StatusID: 0,
+    DueDate: taskDetails.dueDate,
+    Reminder: taskDetails.reminder,
+    ...(taskDetails.endDate ? { EndDate: taskDetails.endDate } : {}),
+    ...(taskDetails.comments ? { Comments: `[Retry] ${taskDetails.comments}` } : {}),
+  };
+
+  const taskResult = await createTask(taskPayload);
+
+  await insertTaskLog({
+    ...normalized,
+    caseId,
+    lookupMethod: row.lookup_method,
+    taskId: taskResult.taskId,
+    taskSubject: taskDetails.subject,
+    officerName: officer.name,
+    officerUserId: officer.userId,
+    assignmentMethod,
+    appointmentStart: taskDetails.dueDate,
+    appointmentEnd: taskDetails.endDate,
+    status: taskResult.ok ? "success" : "task_failed",
+    errorMessage: taskResult.errorMessage || null,
+  });
+
+  if (taskResult.ok) {
+    await completePendingTask(row.id);
+    results.completed++;
+    console.log(`Pending #${row.id}: task_failed retry succeeded (case ${caseId}, officer ${officer.name})`);
+  } else {
+    console.log(`Pending #${row.id}: task_failed retry failed again — officer ${officer.name}: ${taskResult.errorMessage}`);
+    await incrementRetry(row.id, row.retry_count, taskResult.errorMessage, "task_failed");
+    results.failed++;
+  }
+}
+
 async function processPendingQueue() {
   const pending = await getPendingTasks();
-  const results = { processed: 0, completed: 0, retried: 0, failed: 0 };
+  const results = { processed: 0, completed: 0, retried: 0, failed: 0, autoCreated: 0 };
 
   for (const row of pending) {
     results.processed++;
 
     try {
+      // --- TASK_FAILED: skip case search, retry task creation with officer rotation ---
+      if (row.reason === "task_failed" && row.case_id) {
+        await processTaskFailed(row, results);
+        continue;
+      }
+
+      // --- MISSING_CONTACT_INFO: recover email/phone by name ---
+      if (row.reason === "missing_contact_info" && !row.email && !row.phone) {
+        const contactName = [row.first_name, row.last_name].filter(Boolean).join(" ").trim();
+        if (contactName) {
+          console.log(`Pending #${row.id}: attempting name-based contact recovery for "${contactName}"`);
+          const recovered = await findGhlContactByName(contactName, row.first_name, row.last_name);
+          if (recovered?.email || recovered?.phone) {
+            console.log(`Pending #${row.id}: recovery succeeded — email=${recovered.email}, phone=${recovered.phone}`);
+            row.email = recovered.email || row.email;
+            row.phone = recovered.phone || row.phone;
+            await updatePendingTaskContactInfo(row.id, recovered.email, recovered.phone);
+          } else {
+            console.log(`Pending #${row.id}: name recovery failed`);
+            await incrementRetry(row.id, row.retry_count, "Name-based contact recovery failed", row.reason);
+            results.retried++;
+            continue;
+          }
+        } else {
+          await incrementRetry(row.id, row.retry_count, "No name available for recovery", row.reason);
+          results.retried++;
+          continue;
+        }
+      }
+
+      // --- APPOINTMENT DATA RECOVERY ---
       const ghlData = await fetchAppointmentFromGhl(row.email, row.phone);
 
       if (!ghlData.appointmentStart) {
-        await incrementRetry(row.id, row.retry_count, "GHL API returned no appointment data");
+        console.log(`Pending #${row.id}: GHL API failed — trying AI agent`);
+        const agentData = await fetchAppointmentViaAgent(
+          row.email, row.phone,
+          [row.first_name, row.last_name].filter(Boolean).join(" ") || null,
+          null
+        );
+        if (agentData.appointmentStart) Object.assign(ghlData, agentData);
+      }
+
+      // Allow case_not_found entries to proceed without appointment data
+      const isAutoCreateReady =
+        row.reason === "case_not_found" &&
+        !row.case_id &&
+        row.retry_count + 1 >= MAX_CASE_NOT_FOUND_RETRIES;
+
+      if (!ghlData.appointmentStart && !isAutoCreateReady) {
+        await incrementRetry(row.id, row.retry_count, "GHL API + Agent both returned no appointment data", row.reason);
         results.retried++;
         continue;
       }
 
+      // --- ESCALATING CASE SEARCH ---
       let caseId = row.case_id;
       let lookupMethod = row.lookup_method;
+      let assignedOfficer = null;
+      let assignedMethod = null;
 
       if (!caseId) {
-        const lookup = await findCase(row.email, row.phone);
-        caseId = lookup.caseId;
-        lookupMethod = lookup.lookupMethod;
+        const searchResult = await escalatingCaseSearch(row, results);
+        if (!searchResult) continue; // escalatingCaseSearch already called incrementRetry
+        caseId = searchResult.caseId;
+        lookupMethod = searchResult.lookupMethod;
+        if (searchResult.officer) {
+          assignedOfficer = searchResult.officer;
+          assignedMethod = searchResult.method;
+        }
       }
 
-      if (!caseId) {
-        await incrementRetry(row.id, row.retry_count, "Case still not found in IRS Logics");
-        results.retried++;
-        continue;
-      }
-
+      // --- DEDUP ---
       const parsedStart = parseGhlDate(ghlData.appointmentStart) || ghlData.appointmentStart;
       if (await isDuplicateTask(caseId, parsedStart)) {
         await completePendingTask(row.id);
@@ -64,6 +315,7 @@ async function processPendingQueue() {
         continue;
       }
 
+      // --- BUILD & CREATE TASK ---
       const normalized = {
         firstName: row.first_name,
         lastName: row.last_name,
@@ -78,17 +330,27 @@ async function processPendingQueue() {
       };
 
       let officer, assignmentMethod;
-      const caseOfficer = await getCaseOfficer(caseId);
-      if (caseOfficer) {
-        officer = caseOfficer;
-        assignmentMethod = "case_officer";
+      if (assignedOfficer) {
+        officer = assignedOfficer;
+        assignmentMethod = assignedMethod;
       } else {
-        const assignment = await getNextOfficer();
-        officer = assignment.officer;
-        assignmentMethod = "round_robin";
+        const caseOfficer = await getCaseOfficer(caseId);
+        if (caseOfficer) {
+          officer = caseOfficer;
+          assignmentMethod = "case_officer";
+        } else {
+          const assignment = await getNextOfficer();
+          officer = assignment.officer;
+          assignmentMethod = "round_robin";
+        }
       }
 
       const taskDetails = buildTaskDetails(normalized);
+
+      let comments = taskDetails.comments || "";
+      if (assignmentMethod === "auto_created") {
+        comments = `[Auto-Created Case] ${comments}`.trim();
+      }
 
       const taskPayload = {
         CaseID: caseId,
@@ -100,7 +362,7 @@ async function processPendingQueue() {
         DueDate: taskDetails.dueDate,
         Reminder: taskDetails.reminder,
         ...(taskDetails.endDate ? { EndDate: taskDetails.endDate } : {}),
-        ...(taskDetails.comments ? { Comments: taskDetails.comments } : {}),
+        ...(comments ? { Comments: comments } : {}),
       };
 
       const taskResult = await createTask(taskPayload);
@@ -125,12 +387,12 @@ async function processPendingQueue() {
         results.completed++;
         console.log(`Pending #${row.id}: task created successfully (case ${caseId})`);
       } else {
-        await incrementRetry(row.id, row.retry_count, taskResult.errorMessage);
+        await incrementRetry(row.id, row.retry_count, taskResult.errorMessage, row.reason);
         results.failed++;
       }
     } catch (error) {
       console.error(`Pending #${row.id} error:`, error.message);
-      await incrementRetry(row.id, row.retry_count, error.message);
+      await incrementRetry(row.id, row.retry_count, error.message, row.reason);
       results.failed++;
     }
   }
