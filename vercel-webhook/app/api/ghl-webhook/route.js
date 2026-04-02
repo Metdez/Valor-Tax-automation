@@ -1,8 +1,19 @@
 import { NextResponse } from "next/server";
-import { createTask, findCase, getCaseOfficer, parseGhlDate } from "@/lib/irs-logics";
-import { fetchAppointmentFromGhl } from "@/lib/ghl";
+import {
+  createCaseActivity,
+  createTask,
+  findCase,
+  getCaseOfficer,
+  parseGhlDate,
+} from "@/lib/irs-logics";
+import { fetchAppointmentFromGhl, findGhlContactByName } from "@/lib/ghl";
+import { fetchAppointmentViaAgent } from "@/lib/agent";
 import { getNextOfficer, insertTaskLog } from "@/lib/supabase";
-import { buildTaskDetails, normalizeWebhookPayload } from "@/lib/webhook";
+import {
+  buildCaseActivityDetails,
+  buildTaskDetails,
+  normalizeWebhookPayload,
+} from "@/lib/webhook";
 import { buildPendingEntry, insertPendingTask } from "@/lib/pending";
 import { isDuplicateTask } from "@/lib/dedup";
 
@@ -13,6 +24,17 @@ async function safeInsertTaskLog(entry) {
     await insertTaskLog(entry);
   } catch (error) {
     console.error("task_logs insert failed:", error);
+  }
+}
+
+async function safeCreateCaseActivity(activityPayload) {
+  try {
+    const result = await createCaseActivity(activityPayload);
+    if (!result.ok) {
+      console.error("case activity creation failed:", result.errorMessage);
+    }
+  } catch (error) {
+    console.error("case activity creation failed:", error);
   }
 }
 
@@ -29,16 +51,59 @@ export async function POST(request) {
     const body = await request.json();
     normalized = normalizeWebhookPayload(body);
 
+    // Recovery: if email/phone are missing, try to find the contact by name in GHL
     if (!normalized.email && !normalized.phone) {
-      const errorMessage = "Missing email and phone - cannot find case";
+      const contactName = [normalized.firstName, normalized.lastName]
+        .filter(Boolean).join(" ").trim();
 
-      await safeInsertTaskLog({
-        ...normalized,
-        status: "error",
-        errorMessage,
-      });
+      if (contactName) {
+        console.log(`Missing email/phone — attempting name-based recovery for "${contactName}"`);
+        try {
+          const recovered = await findGhlContactByName(
+            contactName, normalized.firstName, normalized.lastName
+          );
+          if (recovered?.email || recovered?.phone) {
+            console.log(`Name recovery succeeded: email=${recovered.email}, phone=${recovered.phone}`);
+            if (recovered.email) normalized.email = recovered.email;
+            if (recovered.phone) normalized.phone = recovered.phone;
+          }
+        } catch (error) {
+          console.error("Name-based recovery failed:", error.message);
+        }
+      }
 
-      return NextResponse.json({ error: errorMessage }, { status: 400 });
+      // If still no email/phone after recovery attempt, queue or 400
+      if (!normalized.email && !normalized.phone) {
+        if (contactName) {
+          console.log("Name recovery failed — queuing to pending_tasks for retry");
+          const pendingEntry = buildPendingEntry(normalized, {
+            caseId: null,
+            lookupMethod: null,
+            reason: "missing_contact_info",
+          });
+          await insertPendingTask(pendingEntry);
+
+          await safeInsertTaskLog({
+            ...normalized,
+            status: "error",
+            errorMessage: `Missing email/phone — name recovery failed, queued for retry (name: ${contactName})`,
+          });
+
+          return NextResponse.json({
+            success: true,
+            queued: true,
+            message: "Missing email/phone — queued for contact info recovery",
+          });
+        }
+
+        const errorMessage = "Missing email, phone, and name - cannot identify contact";
+        await safeInsertTaskLog({
+          ...normalized,
+          status: "error",
+          errorMessage,
+        });
+        return NextResponse.json({ error: errorMessage }, { status: 400 });
+      }
     }
 
     let lookup = await findCase(normalized.email, normalized.phone);
@@ -55,22 +120,27 @@ export async function POST(request) {
     }
 
     if (!caseId) {
-      const errorMessage = `No case found in IRS Logics for email: ${normalized.email || "-"}, phone: ${normalized.phone || "-"}`;
+      console.log("Case not found after retry — queuing to pending_tasks for delayed retry");
+
+      const pendingEntry = buildPendingEntry(normalized, {
+        caseId: null,
+        lookupMethod,
+        reason: "case_not_found",
+      });
+      await insertPendingTask(pendingEntry);
 
       await safeInsertTaskLog({
         ...normalized,
         lookupMethod,
         status: "case_not_found",
-        errorMessage,
+        errorMessage: `Case not found — queued for retry (email: ${normalized.email || "-"}, phone: ${normalized.phone || "-"})`,
       });
 
-      return NextResponse.json(
-        {
-          error: "Case not found",
-          message: errorMessage,
-        },
-        { status: 404 }
-      );
+      return NextResponse.json({
+        success: true,
+        queued: true,
+        message: "Case not found — queued for delayed retry",
+      });
     }
 
     // If the webhook payload is missing appointment times, fetch from GHL API
@@ -95,12 +165,27 @@ export async function POST(request) {
       }
     }
 
+    // AGENT FALLBACK: If GHL API didn't return data, try AI agent with MCP
+    if (!normalized.appointmentStart) {
+      console.log("GHL API returned no data — trying AI agent with MCP");
+      const agentData = await fetchAppointmentViaAgent(
+        normalized.email,
+        normalized.phone,
+        [normalized.firstName, normalized.lastName].filter(Boolean).join(" ") || null,
+        null
+      );
+      if (agentData.appointmentStart) normalized.appointmentStart = agentData.appointmentStart;
+      if (agentData.appointmentEnd) normalized.appointmentEnd = agentData.appointmentEnd;
+      if (agentData.appointmentTitle && !normalized.appointmentTitle) normalized.appointmentTitle = agentData.appointmentTitle;
+      if (agentData.calendarName && !normalized.calendarName) normalized.calendarName = agentData.calendarName;
+    }
+
     // GATE: If we STILL don't have appointment data after GHL fallback,
     // queue to pending_tasks instead of creating a task with fake times
     if (!normalized.appointmentStart) {
       console.log("Still no appointment data after GHL fallback — queuing to pending_tasks");
 
-      const pendingEntry = buildPendingEntry(normalized, { caseId, lookupMethod });
+      const pendingEntry = buildPendingEntry(normalized, { caseId, lookupMethod, reason: "missing_appointment" });
       await insertPendingTask(pendingEntry);
 
       await safeInsertTaskLog({
@@ -161,6 +246,21 @@ export async function POST(request) {
     taskId = taskResult.taskId;
 
     if (!taskResult.ok) {
+      // Queue to pending for retry instead of dead-ending
+      const pendingEntry = buildPendingEntry(normalized, {
+        caseId,
+        lookupMethod,
+        reason: "task_failed",
+      });
+      pendingEntry.error_message = taskResult.errorMessage;
+
+      try {
+        await insertPendingTask(pendingEntry);
+        console.log(`Task creation failed — queued for retry (case ${caseId}, officer ${officer.name}): ${taskResult.errorMessage}`);
+      } catch (pendingError) {
+        console.error("Failed to queue task_failed to pending:", pendingError.message);
+      }
+
       await safeInsertTaskLog({
         ...normalized,
         caseId,
@@ -176,15 +276,23 @@ export async function POST(request) {
         errorMessage: taskResult.errorMessage,
       });
 
-      return NextResponse.json(
-        {
-          error: "Failed to create task in IRS Logics",
-          caseId,
-          details: taskResult.result,
-        },
-        { status: taskResult.status || 500 }
-      );
+      return NextResponse.json({
+        success: true,
+        queued: true,
+        caseId,
+        message: `Task creation failed — queued for retry: ${taskResult.errorMessage}`,
+      });
     }
+
+    await safeCreateCaseActivity({
+      CaseID: caseId,
+      ...buildCaseActivityDetails(normalized, {
+        taskId,
+        assignedTo: officer.name,
+        assignmentMethod,
+        taskSubject: taskDetails.subject,
+      }),
+    });
 
     await safeInsertTaskLog({
       ...normalized,
