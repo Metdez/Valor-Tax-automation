@@ -1,9 +1,68 @@
 import { supabaseRest, getSupabaseAdmin } from "./supabase.js";
 
-const MAX_RETRIES = 6;
+export const MAX_RETRIES = 288;
+export const MAX_CASE_NOT_FOUND_RETRIES = 4;
+export const MAX_MISSING_CONTACT_INFO_RETRIES = 3;
+export const MAX_TASK_FAILED_RETRIES = 3;
 
-export function buildPendingEntry(normalized, { caseId, lookupMethod }) {
-  return {
+const CASE_NOT_FOUND_DELAYS_MS = [
+  5 * 60 * 1000,    // retry 1: 5 minutes
+  10 * 60 * 1000,   // retry 2: 10 minutes
+  30 * 60 * 1000,   // retry 3: 30 minutes
+  // retry 4: no delay — auto-create fires immediately
+];
+
+const MISSING_CONTACT_INFO_DELAYS_MS = [
+  5 * 60 * 1000,      // 1st retry: 5 minutes
+  30 * 60 * 1000,     // 2nd retry: 30 minutes
+  2 * 60 * 60 * 1000, // 3rd retry: 2 hours
+];
+
+const TASK_FAILED_DELAYS_MS = [
+  5 * 60 * 1000,    // retry 1: 5 minutes  — same officer
+  10 * 60 * 1000,   // retry 2: 10 minutes — different officer
+  30 * 60 * 1000,   // retry 3: 30 minutes — different officer again
+];
+
+export function computeNextRetryAt(reason, currentRetryCount) {
+  if (reason === "case_not_found") {
+    const delayMs = CASE_NOT_FOUND_DELAYS_MS[currentRetryCount];
+    if (delayMs === undefined) return null;
+    return new Date(Date.now() + delayMs).toISOString();
+  }
+  if (reason === "missing_contact_info") {
+    const delayMs = MISSING_CONTACT_INFO_DELAYS_MS[currentRetryCount];
+    if (delayMs === undefined) return null;
+    return new Date(Date.now() + delayMs).toISOString();
+  }
+  if (reason === "task_failed") {
+    const delayMs = TASK_FAILED_DELAYS_MS[currentRetryCount];
+    if (delayMs === undefined) return null;
+    return new Date(Date.now() + delayMs).toISOString();
+  }
+  return null;
+}
+
+export function getRetryStatus(nextRetryCount, reason) {
+  if (reason === "case_not_found") {
+    return "pending"; // never needs_review — auto-create handles exhaustion
+  }
+  if (reason === "task_failed") {
+    return nextRetryCount >= MAX_TASK_FAILED_RETRIES ? "needs_review" : "pending";
+  }
+  if (reason === "missing_contact_info") {
+    return nextRetryCount >= MAX_MISSING_CONTACT_INFO_RETRIES ? "needs_review" : "pending";
+  }
+  return nextRetryCount >= MAX_RETRIES ? "needs_review" : "pending";
+}
+
+export function buildPendingTasksQuery(limit = 20) {
+  const now = new Date().toISOString();
+  return `pending_tasks?status=in.(pending,processing)&or=(next_retry_at.is.null,next_retry_at.lte.${now})&order=created_at.asc&limit=${limit}`;
+}
+
+export function buildPendingEntry(normalized, { caseId, lookupMethod, reason }) {
+  const entry = {
     first_name: normalized.firstName,
     last_name: normalized.lastName,
     email: normalized.email,
@@ -16,7 +75,13 @@ export function buildPendingEntry(normalized, { caseId, lookupMethod }) {
     lookup_method: lookupMethod || null,
     status: "pending",
     retry_count: 0,
+    reason: reason || null,
   };
+
+  const nextRetryAt = computeNextRetryAt(reason, 0);
+  if (nextRetryAt) entry.next_retry_at = nextRetryAt;
+
+  return entry;
 }
 
 export async function insertPendingTask(entry) {
@@ -26,9 +91,7 @@ export async function insertPendingTask(entry) {
 }
 
 export async function getPendingTasks() {
-  const rows = await supabaseRest(
-    `pending_tasks?status=in.(pending,processing)&retry_count=lt.${MAX_RETRIES}&order=created_at.asc&limit=20`
-  );
+  const rows = await supabaseRest(buildPendingTasksQuery());
   return rows || [];
 }
 
@@ -40,18 +103,27 @@ export async function completePendingTask(id) {
   });
 }
 
-export async function incrementRetry(id, currentRetryCount, errorMessage) {
+export async function incrementRetry(id, currentRetryCount, errorMessage, reason) {
   const newCount = currentRetryCount + 1;
-  const newStatus = newCount >= MAX_RETRIES ? "needs_review" : "pending";
+  const newStatus = getRetryStatus(newCount, reason);
+
+  const body = {
+    retry_count: newCount,
+    status: newStatus,
+    error_message: errorMessage || null,
+    updated_at: new Date().toISOString(),
+  };
+
+  const nextRetryAt = computeNextRetryAt(reason, newCount);
+  if (nextRetryAt) {
+    body.next_retry_at = nextRetryAt;
+  } else if (reason === "case_not_found") {
+    body.next_retry_at = null;
+  }
 
   await supabaseRest(`pending_tasks?id=eq.${id}`, {
     method: "PATCH",
-    body: {
-      retry_count: newCount,
-      status: newStatus,
-      error_message: errorMessage || null,
-      updated_at: new Date().toISOString(),
-    },
+    body,
     headers: { Prefer: "return=minimal" },
   });
 }
@@ -76,4 +148,16 @@ export async function getNeedsReviewCount() {
     }
   );
   return count || 0;
+}
+
+export async function updatePendingTaskContactInfo(id, email, phone) {
+  const body = { updated_at: new Date().toISOString() };
+  if (email) body.email = email;
+  if (phone) body.phone = phone;
+
+  await supabaseRest(`pending_tasks?id=eq.${id}`, {
+    method: "PATCH",
+    body,
+    headers: { Prefer: "return=minimal" },
+  });
 }
