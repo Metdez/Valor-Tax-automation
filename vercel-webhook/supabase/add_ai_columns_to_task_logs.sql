@@ -1,0 +1,2 @@
+ALTER TABLE task_logs ADD COLUMN IF NOT EXISTS ai_summary TEXT;
+ALTER TABLE task_logs ADD COLUMN IF NOT EXISTS ai_transcript TEXT;

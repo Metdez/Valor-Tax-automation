@@ -23,6 +23,9 @@ export default async function DashboardPage() {
       <div>
         <h1 className="text-3xl font-bold text-navy">Dashboard</h1>
         <p className="text-gray-500 mt-1">{formattedDate}</p>
+        <p className="text-sm text-gray-400 mt-2">
+          GHL recovery mode: {stats.ghlRecoveryMode}
+        </p>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-5 gap-5">

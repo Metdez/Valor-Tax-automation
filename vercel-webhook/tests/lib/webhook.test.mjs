@@ -1,0 +1,184 @@
+import assert from "node:assert/strict";
+
+import {
+  buildCaseActivityDetails,
+  buildTaskDetails,
+  normalizeWebhookPayload,
+  pickFirstValue,
+  toPacificISO,
+} from "../../lib/webhook.js";
+import { extractCaseId, formatPhone, parseGhlDate } from "../../lib/irs-logics.js";
+
+function run(name, fn) {
+  try {
+    fn();
+    console.log(`PASS ${name}`);
+  } catch (error) {
+    console.error(`FAIL ${name}`);
+    throw error;
+  }
+}
+
+run("pickFirstValue returns the first non-empty value", () => {
+  const value = pickFirstValue(
+    { first_name: "", "First Name": "Jane", fallback: "Ignored" },
+    "first_name",
+    "First Name",
+    "fallback"
+  );
+
+  assert.equal(value, "Jane");
+});
+
+run("normalizeWebhookPayload supports ghl custom field names", () => {
+  const payload = normalizeWebhookPayload({
+    "First Name": "Jane",
+    "Last Name": "Doe",
+    Email: "jane@example.com",
+    Phone: "15551234567",
+    appointment_title: "Consultation",
+    appointment_start_time: "Tuesday, March 31, 2026 3:00 PM",
+    appointment_end_time: "Tuesday, March 31, 2026 3:45 PM",
+    calender: "Valor Tax Appointment",
+    conversations_ai_summary: "Needs help",
+    conversations_ai_transcript: "Full transcript",
+  });
+
+  assert.deepEqual(payload, {
+    firstName: "Jane",
+    lastName: "Doe",
+    email: "jane@example.com",
+    phone: "(555)123-4567",
+    appointmentTitle: "Consultation",
+    appointmentStart: "Tuesday, March 31, 2026 3:00 PM",
+    appointmentEnd: "Tuesday, March 31, 2026 3:45 PM",
+    calendarName: "Valor Tax Appointment",
+    aiSummary: "Needs help",
+    aiTranscript: "Full transcript",
+  });
+});
+
+run("toPacificISO converts UTC to Pacific time without Z suffix", () => {
+  // 10:30 PM UTC on Apr 6 = 3:30 PM PDT
+  assert.equal(toPacificISO("2026-04-06T22:30:00.000Z"), "2026-04-06T15:30:00");
+  // Midnight UTC on Jan 1 = 4:00 PM PST the day before (UTC-8 in winter)
+  assert.equal(toPacificISO("2026-01-01T00:00:00.000Z"), "2025-12-31T16:00:00");
+  // Null/undefined pass through
+  assert.equal(toPacificISO(null), null);
+  assert.equal(toPacificISO(undefined), undefined);
+});
+
+run("buildTaskDetails creates task subject, dates, and comments", () => {
+  // Use UTC ISO inputs for timezone-independent test
+  const details = buildTaskDetails({
+    firstName: "Jane",
+    lastName: "Doe",
+    appointmentTitle: "Consultation",
+    appointmentStart: "2026-04-06T22:30:00.000Z",
+    appointmentEnd: "2026-04-06T23:15:00.000Z",
+    calendarName: "Valor Tax Appointment",
+    aiSummary: "Needs help",
+    aiTranscript: "Full transcript",
+  });
+
+  assert.equal(
+    details.subject,
+    "Appointment: Consultation — Apr 6, 2026, 3:30 PM PDT"
+  );
+  // DueDate should be Pacific time, no Z suffix
+  assert.equal(details.dueDate, "2026-04-06T15:30:00");
+  assert.equal(details.endDate, "2026-04-06T16:15:00");
+  assert.ok(!details.dueDate.endsWith("Z"), "dueDate must not end with Z");
+  assert.equal(
+    details.comments,
+    [
+      "Calendar: Valor Tax Appointment",
+      "Contact: Jane Doe",
+      "Appointment Start: Apr 6, 2026, 3:30 PM PDT",
+      "Appointment End: Apr 6, 2026, 4:15 PM PDT",
+      "AI Summary: Needs help",
+      "Transcript: Full transcript",
+    ].join("\n")
+  );
+});
+
+run("buildTaskDetails falls back to current time when appointment time missing", () => {
+  const details = buildTaskDetails({
+    firstName: "Scott",
+    lastName: "Stallard",
+  });
+
+  assert.equal(details.subject, "Appointment: Scott Stallard");
+  assert.ok(!details.dueDate.endsWith("Z"), "fallback dueDate must be Pacific (no Z)");
+  assert.equal(details.dueDate, details.reminder);
+  assert.equal(details.endDate, undefined);
+  assert.ok(details.comments.includes("⚠ No appointment time received"));
+  assert.ok(details.comments.includes("Check GHL Workflow"));
+});
+
+run("buildCaseActivityDetails creates subject and comment for successful task logging", () => {
+  const activity = buildCaseActivityDetails(
+    {
+      firstName: "Jane",
+      lastName: "Doe",
+      appointmentStart: "Tuesday, March 31, 2026 3:00 PM",
+      calendarName: "Valor Tax Appointment",
+      aiSummary: "Needs help",
+    },
+    {
+      taskId: 98765,
+      assignedTo: "Anthony Edwards",
+      assignmentMethod: "case_officer",
+      taskSubject: "Appointment: Consultation â€” Tuesday, March 31, 2026 3:00 PM",
+    }
+  );
+
+  assert.deepEqual(activity, {
+    subject: "Auto Task Created: Appointment: Consultation â€” Tuesday, March 31, 2026 3:00 PM",
+    comment: [
+      "An IRS Logics task was created automatically from the GHL appointment webhook.",
+      "Task ID: 98765",
+      "Assigned To: Anthony Edwards",
+      "Assignment Method: case_officer",
+      "Contact: Jane Doe",
+      "Appointment Start: Mar 31, 2026, 12:00 PM PDT",
+      "Calendar: Valor Tax Appointment",
+      "AI Summary: Needs help",
+    ].join("\n"),
+    popup: false,
+    pin: false,
+  });
+});
+
+run("normalizeWebhookPayload handles calendar as object", () => {
+  const payload = normalizeWebhookPayload({
+    "First Name": "Test",
+    calender: { name: "Valor Tax Appointment", id: "abc123" },
+  });
+
+  assert.equal(payload.calendarName, "Valor Tax Appointment");
+});
+
+run("formatPhone normalizes 10 or 11 digit values", () => {
+  assert.equal(formatPhone("5551234567"), "(555)123-4567");
+  assert.equal(formatPhone("15551234567"), "(555)123-4567");
+  assert.equal(formatPhone("12"), undefined);
+});
+
+run("parseGhlDate strips the weekday and returns iso output", () => {
+  assert.equal(parseGhlDate("Tuesday, March 31, 2026 3:00 PM"), "2026-03-31T19:00:00.000Z");
+  assert.equal(parseGhlDate("invalid"), undefined);
+});
+
+run("extractCaseId prefers active cases with the newest created date", () => {
+  const caseId = extractCaseId({
+    Success: true,
+    Data: [
+      { CaseID: 1, SaleDate: null, CreatedDate: "2024-01-01T00:00:00.000Z" },
+      { CaseID: 2, SaleDate: "2025-05-01T00:00:00.000Z", CreatedDate: "2024-02-01T00:00:00.000Z" },
+      { CaseID: 3, SaleDate: "2025-06-01T00:00:00.000Z", CreatedDate: "2024-03-01T00:00:00.000Z" },
+    ],
+  });
+
+  assert.equal(caseId, 3);
+});

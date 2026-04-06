@@ -1,4 +1,5 @@
 import { getOfficers } from "./officers.js";
+import { getGhlRecoveryMode } from "./ghl.js";
 import { findCase, formatPhone, getCaseInfo } from "./irs-logics.js";
 import { supabaseRest, peekNextOfficer } from "./supabase.js";
 import { getPendingCount, getNeedsReviewCount } from "./pending.js";
@@ -108,6 +109,7 @@ export async function getDashboardStats() {
     tasksToday,
     tasksThisWeek,
     successRate,
+    ghlRecoveryMode: getGhlRecoveryMode(),
     roundRobinIndex: roundRobinPreview.currentIndex,
     nextOfficer: roundRobinPreview.nextOfficer.name,
     recentActivity: (recentLogs || []).map(mapTaskLog),
@@ -159,6 +161,21 @@ export async function getCaseHistory(caseId) {
     `task_logs?case_id=eq.${encodeURIComponent(caseId)}&select=*&order=created_at.desc`
   );
   return (data || []).map(mapTaskLog);
+}
+
+export async function getCaseDeepDive(caseId) {
+  const [caseInfo, taskHistory] = await Promise.all([
+    getCaseInfo(caseId, "setofficerid,attorneyid,casemanagerid,caseworkerid"),
+    getCaseHistory(caseId),
+  ]);
+  return { caseInfo, taskHistory };
+}
+
+export async function getCaseConversations(caseId) {
+  const data = await supabaseRest(
+    `task_logs?case_id=eq.${encodeURIComponent(caseId)}&ai_summary=not.is.null&select=id,created_at,ai_summary,ai_transcript,task_subject&order=created_at.desc`
+  );
+  return data || [];
 }
 
 export async function lookupCase({ email, phone }) {

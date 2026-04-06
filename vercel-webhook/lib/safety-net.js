@@ -49,8 +49,8 @@ export async function fetchRecentGhlAppointments() {
       const appt = await getContactAppointment(contactId);
       if (!appt || !appt.startTime) continue;
 
-      let calendarName = null;
-      if (appt.calendarId) {
+      let calendarName = appt.calendarName || null;
+      if (!calendarName && appt.calendarId) {
         calendarName = await getCalendarName(appt.calendarId);
       }
 

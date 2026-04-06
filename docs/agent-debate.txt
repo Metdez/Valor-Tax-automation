@@ -1,0 +1,368 @@
+================================================================================
+  VALOR DASHBOARD FEATURE BRAINSTORM — MULTI-AGENT DEBATE TRANSCRIPT
+  7 Agents | 53 Feature Ideas | March 31, 2026
+================================================================================
+
+MODERATOR: Each agent has proposed 5-8 features. Now we debate. Each agent
+will argue for their TOP 3 picks, challenge other agents' proposals, and
+defend against criticism. The goal: identify the 10-15 features that would
+transform this dashboard from a webhook monitor into the ultimate tax
+resolution command center.
+
+================================================================================
+  ROUND 1: OPENING STATEMENTS — Each Agent's Top 3
+================================================================================
+
+AGENT FINANCE:
+My top 3 are:
+1. Revenue Pipeline Monitor — Total contracted, collected, outstanding across
+   all cases. The single metric that matters most to firm leadership.
+2. Case Billing Health Score — Red/yellow/green badge on every case showing
+   payment status. Officers need this before every client call.
+3. Collections At-Risk Board — Dedicated page listing every case with missed
+   payments. Proactive collections = recovered revenue.
+
+Why finance first? Every other feature is operational plumbing. Revenue is why
+this firm exists. If we build one thing, it should answer "are we getting paid?"
+
+AGENT CASES:
+My top 3 are:
+1. Case Activity Timeline — Unified chronological feed from IRS Logics +
+   task_logs + GHL. This is the foundation every other feature builds on.
+2. Case Status Pipeline (Kanban) — Visual board of all cases by status.
+   Management needs to see the pipeline, not just individual cases.
+3. Stuck Case Alerts — Automated detection of cases with no activity in 14+
+   days. Compliance-critical for a tax firm.
+
+Finance is important, but you can't track revenue if you can't even see your
+cases. Case visibility is the foundation. Build that first, billing on top.
+
+AGENT ANALYTICS:
+My top 3 are:
+1. Error Rate Monitor — Failures are currently silent. This is an ops hygiene
+   emergency. No new APIs needed — pure Supabase queries.
+2. Task Volume Trend Chart — Time-series of daily task volume. The most basic
+   analytics feature that's completely missing today.
+3. Case Pipeline Funnel — Appointment → Case Found → Task Created → Paying
+   Client. This is THE metric for the business.
+
+I agree with FINANCE on revenue mattering, but disagree on approach. You don't
+need to call IRS Logics billing APIs for every case — that's expensive and
+slow. Start with what's FREE: Supabase data you already have. Task volume
+trends and error rates cost zero API calls and ship in a day.
+
+AGENT CALENDAR:
+My top 3 are:
+1. IRS Logics Appointment Booker — Book follow-ups directly from the
+   dashboard. The appointment APIs are a goldmine sitting completely unused.
+2. Appointment Analytics — Heatmap of when appointments happen. Zero new APIs,
+   uses existing task_logs data.
+3. Officer Availability Gate — Check availability before round-robin
+   assignment. Stop blind assignment.
+
+Everyone's talking about viewing data. I'm talking about DOING things. The
+appointment APIs let us book, check availability, and manage schedules — all
+unused today. That's the biggest gap in the system.
+
+AGENT COMMS:
+My top 3 are:
+1. IRS Fax Sender — Tax firms send hundreds of faxes to the IRS monthly.
+   This is a massive daily workflow completely absent from the dashboard.
+2. Automated Case Activity Logging — When the webhook creates a task, also
+   write an IRS Logics activity note. ~20 lines of code, huge payoff.
+3. GHL Conversation Summary Panel — The AI summary data already sits in
+   task_logs with zero UI. Officers should see it before every call.
+
+Here's my challenge to everyone: you're all proposing READ features. Reading
+data is nice. But the real value is WRITE features that eliminate manual work.
+Faxing, note-taking, activity logging — these are actions officers do dozens
+of times a day in OTHER systems. Bring those actions here.
+
+AGENT AUTOMATION:
+My top 3 are:
+1. Auto Case Creation — When a GHL lead has no IRS Logics case, create one
+   automatically. Eliminates manual data entry at top of funnel.
+2. No-Show Handler — When GHL marks an appointment as no-show, auto-create
+   a re-book task. Currently no-shows silently disappear.
+3. Stale Case Watchdog — Daily cron detecting cases with no activity in 14+
+   days. Same as CASES proposed, but I'd add auto-pinned activity notes.
+
+The current system has ONE automation (appointment → task). There should be
+TEN. Every manual step that exists between GHL and IRS Logics is a dropped
+ball waiting to happen. Automate the boring stuff.
+
+AGENT UX:
+My top 3 are:
+1. "My Cases" Personal Dashboard — Officers need to see THEIR caseload, not
+   the global overview. This drives daily engagement.
+2. Case Deep-Dive Page — Full case detail at /case/[id] with inline notes,
+   billing, timeline, all staff. One page to rule them all.
+3. Pending Task Failure Center — A notification inbox for failed webhooks.
+   Red badge on the sidebar. Right now failures are invisible.
+
+Everyone's proposing features that assume officers will go FIND the data. I'm
+proposing features that PUT the data in front of them. If the dashboard doesn't
+feel personal and urgent, nobody will open it.
+
+================================================================================
+  ROUND 2: CROSS-EXAMINATION & CHALLENGES
+================================================================================
+
+AGENT ANALYTICS → AGENT FINANCE:
+"Revenue Pipeline Monitor" sounds great, but have you considered the API cost?
+You're calling CaseBillingSummary for potentially hundreds of cases. That's N
+API calls on every page load. Even with caching, the initial population takes
+minutes. My Pipeline Funnel gives you conversion-to-revenue insights using
+mostly Supabase data — faster, cheaper, ships sooner.
+
+AGENT FINANCE → AGENT ANALYTICS:
+Fair point on API volume. That's why I specified a billing_cache table with a
+15-minute TTL and a daily cron for population. You're not hitting IRS Logics on
+every page load — you're reading from Supabase cache. But your Pipeline Funnel
+is an approximation. It tells you "appointments became tasks." It doesn't tell
+you "we collected $47,000 this month." There's a ceiling on Supabase-only
+analytics. Real revenue data lives in IRS Logics billing endpoints.
+
+AGENT CASES → AGENT UX:
+Your "Case Deep-Dive Page" is basically my "Case Activity Timeline" plus my
+"Case Notes Composer" combined. I agree it should be one page. But you're
+missing the Kanban pipeline view — individual case pages are great for depth,
+but management needs the BREADTH view. They need to see 200 cases at once,
+grouped by status, not one at a time.
+
+AGENT UX → AGENT CASES:
+The Kanban board is visually impressive, but let's be honest about the
+technical reality. CasesByStatus requires a separate API call per status
+bucket. How many statuses does IRS Logics have? If it's 8-10 statuses, that's
+8-10 parallel API calls just to render the board. And you need to enrich each
+case with officer data. You're looking at 50+ API calls per page load. My
+Case Deep-Dive page is 4-5 calls for one case. Ship what works fast first.
+
+AGENT CASES → AGENT UX:
+Caching solves this. Same pattern as FINANCE's billing cache. Run a nightly
+cron that snapshots all cases by status into a Supabase table. The Kanban
+reads from cache, not live API. Yes it's stale by up to 24 hours — but case
+statuses don't change hourly. It's a tradeoff that works for management.
+
+AGENT COMMS → AGENT AUTOMATION:
+Your "Auto Case Creation" feature — how do you handle the case where a GHL
+contact has a generic email (like john@gmail.com) that might match a completely
+different person's IRS Logics case? The existing system already handles this
+with SaleDate filtering, but auto-creating cases without human verification
+seems risky for a compliance-heavy industry.
+
+AGENT AUTOMATION → AGENT COMMS:
+Good catch. I'd add a confidence gate: only auto-create if (a) no case found
+by email AND phone, and (b) the GHL contact has a specific tag like "Qualified
+Lead" or "Signed Retainer." Without that tag, queue it for manual review
+instead of auto-creating. The feature degrades gracefully — worst case it
+becomes a "Suggested New Cases" queue on the dashboard instead of auto-fire.
+
+AGENT CALENDAR → AGENT AUTOMATION:
+Your "No-Show Handler" is solid, but you're missing the opportunity to
+CHECK AVAILABILITY before creating the re-book task. If you just create a
+generic "re-book appointment" task, someone still has to manually find an open
+slot. Combine it with my Availability Gate — when creating the re-book task,
+also suggest the next 3 available slots in the task comments using
+GetAvailableSlots. Now the officer can re-book in one step.
+
+AGENT AUTOMATION → AGENT CALENDAR:
+Love it. That's a perfect example of combining features. No-Show Handler +
+Availability suggestion in the task comments. Ship as one feature.
+
+AGENT ANALYTICS → AGENT COMMS:
+Your "Automated Case Activity Logging" (writing an IRS Logics activity note
+every time the webhook creates a task) — that's brilliant and should be
+Priority #1 across ALL agents. It's ~20 lines of backend code, zero UI, and
+it makes IRS Logics self-documenting. Every other feature that reads case
+activities benefits from richer data. This is infrastructure, not a feature.
+
+AGENT COMMS:
+Exactly. It's the highest-leverage change in this entire brainstorm. One
+POST call added to the webhook handler, and suddenly IRS Logics has a native
+record of every GHL-originated task. Officers who never touch the dashboard
+still benefit.
+
+AGENT UX → AGENT ANALYTICS:
+Your "Weekly Digest Email" — who's the audience? If it's leadership, sure. But
+if officers are already opening the dashboard daily (which they will with My
+Cases), a push email is redundant. I'd rather invest that effort in the
+Notification Inbox for failed tasks. That's a pull notification with URGENCY,
+not a push report that gets ignored.
+
+AGENT ANALYTICS → AGENT UX:
+Different audiences. The weekly digest is for the firm OWNER who doesn't open
+the dashboard. They want a Monday morning email that says "23 tasks this week,
+2 failures, Anthony handled the most, 3 cases are stale." It's a 1-page PDF
+they read on their phone. Officers get the dashboard. Owners get the email.
+
+AGENT FINANCE → AGENT CALENDAR:
+Your "IRS Logics Appointment Booker" is the most ambitious write-operation
+proposed by anyone. BookAppointment requires AgentEmail, Date, CaseID, and
+handles timezone + slot duration. That's a complex form with real consequences
+if it breaks. Have you verified the BookAppointment API actually works? Given
+that IRS Logics docs say "Header Parameters" but the API actually requires
+query params (per CLAUDE.md), I'd want to test this endpoint manually before
+building a full UI around it.
+
+AGENT CALENDAR → AGENT FINANCE:
+Valid concern. The API quirks with headers vs. query params is documented in
+CLAUDE.md and already handled in the existing codebase (irs-logics.js uses
+query params). BookAppointment is a POST with a body, not query params, so
+it should work as documented. But yes — manual API test first, build UI second.
+That's the directive pattern: test → build → update directive.
+
+================================================================================
+  ROUND 3: CONSENSUS BUILDING — What Should We Build First?
+================================================================================
+
+MODERATOR: Based on the debate, let's identify areas of agreement.
+
+ALL AGENTS AGREE ON:
+
+1. "Automated Case Activity Logging" (COMMS Feature 5) — ~20 lines of code,
+   zero UI, massive payoff. Add a POST /CaseActivity/Activity call to the
+   webhook handler. Every agent benefits from richer IRS Logics activity data.
+   UNANIMOUS PRIORITY #1.
+
+2. "GHL Conversation Summary Panel" (COMMS Feature 4) — Data already exists
+   in task_logs, just needs a UI panel on case lookup. Zero API calls, zero
+   new infrastructure. Free value. UNANIMOUS QUICK WIN.
+
+3. "Error Rate Monitor / Notification Inbox" (ANALYTICS #4 + UX #3) — Both
+   agents proposed essentially the same thing from different angles: make
+   failures visible. ANALYTICS wants a chart, UX wants an inbox. Build BOTH:
+   an error rate chart on the overview page AND a notification inbox with red
+   badge for actionable failures.
+
+4. "Case Detail Page" (UX #2 + CASES #3 + COMMS #1) — Three agents proposed
+   overlapping versions of a unified case detail page with timeline, notes,
+   and billing. Consolidate into one /case/[caseId] page.
+
+STRONG MAJORITY (5-6 agents):
+
+5. "Task Volume Trend Chart" (ANALYTICS #1) — Lowest effort analytics feature.
+   Pure Supabase query. Adds the first chart to a dashboard that currently has
+   zero. Supported by ANALYTICS, UX, FINANCE, CASES, COMMS.
+
+6. "Stuck Case Alerts" (CASES #4 + AUTOMATION #5) — Two agents proposed
+   identical features. Cron-based, reads IRS Logics activity, surfaces stale
+   cases. Compliance-critical. Supported by CASES, AUTOMATION, UX, ANALYTICS.
+
+7. "Appointment Analytics Heatmap" (CALENDAR #4) — Zero new APIs, uses
+   existing task_logs appointment data. Reveals scheduling patterns for staffing
+   decisions. Supported by CALENDAR, ANALYTICS, UX, FINANCE.
+
+CONTESTED BUT HIGH-VALUE:
+
+8. "Revenue Pipeline Monitor" (FINANCE #1) vs. "Case Pipeline Funnel"
+   (ANALYTICS #3) — Both measure conversion, but FINANCE wants real billing
+   data (expensive API calls, needs caching) while ANALYTICS wants Supabase
+   approximation (free, fast, approximate). COMPROMISE: Build the Supabase
+   funnel first (appointments → cases → tasks), add billing data as Phase 2
+   when caching infrastructure is in place.
+
+9. "IRS Fax Sender" (COMMS #3) — High daily-use value for tax firms. FINANCE
+   and CALENDAR are skeptical about the DocumentPath requirement (how do you
+   specify documents?). COMMS argues you start with subject + fax number and
+   add document attachment later. COMPROMISE: Ship fax sender with manual
+   fax number + subject first, add IRS fax directory and document picker later.
+
+10. "Auto Case Creation" (AUTOMATION #1) — Eliminates manual work but has
+    false-positive risk. COMMS raised valid concern about email collisions.
+    COMPROMISE: Ship as "Suggested New Cases" queue first (human reviews),
+    auto-create only for contacts with verified tags.
+
+11. "My Cases Personal Dashboard" (UX #1) — High engagement driver but
+    requires an officer identity mechanism (cookie/dropdown). CASES wants
+    the Kanban board instead. COMPROMISE: Build officer selector first (used
+    everywhere), then "My Cases" as filtered view, then Kanban as Phase 3.
+
+12. "No-Show Handler" (AUTOMATION #7) + Availability suggestion (CALENDAR) —
+    Combined feature. Requires a new GHL webhook trigger (appointment status
+    change). High value, moderate complexity.
+
+================================================================================
+  ROUND 4: FINAL RANKINGS — Each Agent's Vote
+================================================================================
+
+Each agent ranks their top 5 features (across all agents, not just their own):
+
+AGENT FINANCE:
+1. Revenue Pipeline Monitor (mine)
+2. Case Billing Health Score (mine)
+3. Automated Case Activity Logging (COMMS)
+4. Case Pipeline Funnel (ANALYTICS)
+5. Case Deep-Dive Page (UX)
+
+AGENT CASES:
+1. Case Activity Timeline / Deep-Dive Page (UX + mine)
+2. Stuck Case Alerts (mine + AUTOMATION)
+3. Case Status Pipeline Kanban (mine)
+4. Automated Case Activity Logging (COMMS)
+5. Officer Caseload View (mine)
+
+AGENT ANALYTICS:
+1. Error Rate Monitor (mine)
+2. Task Volume Trend Chart (mine)
+3. Case Pipeline Funnel (mine)
+4. Automated Case Activity Logging (COMMS)
+5. Appointment Heatmap (CALENDAR)
+
+AGENT CALENDAR:
+1. IRS Logics Appointment Booker (mine)
+2. Appointment Analytics Heatmap (mine)
+3. Officer Availability Gate (mine)
+4. Automated Case Activity Logging (COMMS)
+5. No-Show Handler + Availability (AUTOMATION + mine)
+
+AGENT COMMS:
+1. Automated Case Activity Logging (mine)
+2. IRS Fax Sender (mine)
+3. GHL Conversation Summary Panel (mine)
+4. Case Deep-Dive Page with Notes (UX)
+5. Officer Notes with Pin/Popup (mine)
+
+AGENT AUTOMATION:
+1. Auto Case Creation (mine)
+2. No-Show Handler (mine)
+3. Stale Case Watchdog (mine)
+4. Automated Case Activity Logging (COMMS)
+5. Overdue Task Escalation (mine)
+
+AGENT UX:
+1. "My Cases" Personal Dashboard (mine)
+2. Case Deep-Dive Page (mine)
+3. Pending Task Failure Center (mine)
+4. Command Palette Cmd+K (mine)
+5. Advanced Search (mine)
+
+================================================================================
+  VOTE TALLY — Features Ranked by Cross-Agent Support
+================================================================================
+
+7/7 votes: Automated Case Activity Logging (COMMS #5)
+5/7 votes: Case Deep-Dive Page with Timeline + Notes (UX #2 + CASES #3)
+4/7 votes: Stuck Case Alerts / Stale Case Watchdog (CASES #4 + AUTO #5)
+3/7 votes: Error Rate Monitor / Notification Inbox (ANALYTICS #4 + UX #3)
+3/7 votes: Case Pipeline Funnel / Revenue Monitor (ANALYTICS #3 + FINANCE #1)
+3/7 votes: Appointment Analytics Heatmap (CALENDAR #4)
+3/7 votes: No-Show Handler + Availability (AUTO #7 + CALENDAR)
+2/7 votes: Task Volume Trend Chart (ANALYTICS #1)
+2/7 votes: IRS Fax Sender (COMMS #3)
+2/7 votes: GHL Conversation Summary Panel (COMMS #4)
+2/7 votes: "My Cases" Personal Dashboard (UX #1)
+2/7 votes: IRS Logics Appointment Booker (CALENDAR #3)
+2/7 votes: Auto Case Creation (AUTO #1)
+2/7 votes: Case Status Kanban (CASES #2 + UX #8)
+2/7 votes: Case Billing Health Score (FINANCE #2)
+1/7 votes: Command Palette (UX #7)
+1/7 votes: Officer Caseload View (CASES #1)
+1/7 votes: Officer Availability Gate (CALENDAR #1)
+1/7 votes: Advanced Search (UX #4)
+1/7 votes: Overdue Task Escalation (AUTO #3)
+1/7 votes: Officer Notes Pin/Popup (COMMS #2)
+
+================================================================================
+  END OF DEBATE — AWAITING OPUS SYNTHESIS
+================================================================================

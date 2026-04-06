@@ -1,0 +1,21 @@
+create table if not exists task_logs (
+  id bigserial primary key,
+  created_at timestamptz default now(),
+  first_name text,
+  last_name text,
+  email text,
+  phone text,
+  case_id integer,
+  lookup_method text,
+  task_id integer,
+  task_subject text,
+  officer_name text,
+  officer_user_id integer,
+  assignment_method text,
+  appointment_title text,
+  appointment_start timestamptz,
+  appointment_end timestamptz,
+  calendar_name text,
+  status text default 'success',
+  error_message text
+);
