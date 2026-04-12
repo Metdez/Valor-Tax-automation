@@ -85,10 +85,10 @@ run("buildTaskDetails creates task subject, dates, and comments", () => {
     details.subject,
     "Appointment: Consultation — Apr 6, 2026, 3:30 PM PDT"
   );
-  // DueDate should be Pacific time, no Z suffix
-  assert.equal(details.dueDate, "2026-04-06T15:30:00");
-  assert.equal(details.endDate, "2026-04-06T16:15:00");
-  assert.ok(!details.dueDate.endsWith("Z"), "dueDate must not end with Z");
+  // DueDate should be UTC ISO with Z — sent directly to IRS Logics
+  assert.equal(details.dueDate, "2026-04-06T22:30:00.000Z");
+  assert.equal(details.endDate, "2026-04-06T23:15:00.000Z");
+  assert.ok(details.dueDate.endsWith("Z"), "dueDate must be UTC ISO with Z");
   assert.equal(
     details.comments,
     [
@@ -109,7 +109,7 @@ run("buildTaskDetails falls back to current time when appointment time missing",
   });
 
   assert.equal(details.subject, "Appointment: Scott Stallard");
-  assert.ok(!details.dueDate.endsWith("Z"), "fallback dueDate must be Pacific (no Z)");
+  assert.ok(details.dueDate.endsWith("Z"), "fallback dueDate must be UTC ISO with Z");
   assert.equal(details.dueDate, details.reminder);
   assert.equal(details.endDate, undefined);
   assert.ok(details.comments.includes("⚠ No appointment time received"));
@@ -141,7 +141,7 @@ run("buildCaseActivityDetails creates subject and comment for successful task lo
       "Assigned To: Anthony Edwards",
       "Assignment Method: case_officer",
       "Contact: Jane Doe",
-      "Appointment Start: Mar 31, 2026, 12:00 PM PDT",
+      "Appointment Start: Mar 31, 2026, 3:00 PM PDT",
       "Calendar: Valor Tax Appointment",
       "AI Summary: Needs help",
     ].join("\n"),
@@ -166,7 +166,11 @@ run("formatPhone normalizes 10 or 11 digit values", () => {
 });
 
 run("parseGhlDate strips the weekday and returns iso output", () => {
-  assert.equal(parseGhlDate("Tuesday, March 31, 2026 3:00 PM"), "2026-03-31T19:00:00.000Z");
+  // GHL webhook format: "3:00 PM" is Pacific wall time (Valor is in CA).
+  // March 31 = PDT (UTC-7). 3:00 PM PDT = 22:00 UTC.
+  assert.equal(parseGhlDate("Tuesday, March 31, 2026 3:00 PM"), "2026-03-31T22:00:00.000Z");
+  // GHL API UTC format should pass through unchanged
+  assert.equal(parseGhlDate("2026-04-12 18:00:00"), "2026-04-12T18:00:00.000Z");
   assert.equal(parseGhlDate("invalid"), undefined);
 });
 

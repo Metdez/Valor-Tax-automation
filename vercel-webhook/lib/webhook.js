@@ -103,10 +103,11 @@ export function buildTaskDetails(payload) {
   const endDate = parseGhlDate(payload.appointmentEnd);
 
   // IRS Logics requires DueDate — fall back to now if GHL didn't send the time.
-  // Convert to Pacific time (Valor operates in CA) so IRS Logics displays the
-  // correct wall-clock time instead of shifting it to Central.
+  // Send UTC ISO with Z directly — naive strings (no Z) are treated as UTC by
+  // IRS Logics, then shifted by the viewer's browser timezone (e.g. 11:00 UTC
+  // → 6:00 AM CDT). UTC with Z lets each user's browser show the correct time.
   const hasTimes = Boolean(parsedStart);
-  const dueDate = toPacificISO(parsedStart) || toPacificISO(new Date().toISOString());
+  const dueDate = parsedStart || new Date().toISOString();
 
   // Build a human-readable time string for the subject line
   const readableStart = formatReadableDate(parsedStart || payload.appointmentStart);
@@ -136,7 +137,7 @@ export function buildTaskDetails(payload) {
     subject,
     dueDate,
     reminder: dueDate,
-    endDate: toPacificISO(endDate),
+    endDate: endDate || undefined,
     comments: comments || undefined,
   };
 }

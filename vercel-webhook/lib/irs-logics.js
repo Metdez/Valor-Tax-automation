@@ -276,13 +276,56 @@ export async function findCaseExhaustive(email, phone, extraEmails = [], extraPh
 export function parseGhlDate(raw) {
   if (!raw) return undefined;
   const cleaned = raw.replace(/^\w+,\s*/, "");
-  const date = new Date(cleaned);
 
-  if (Number.isNaN(date.getTime())) {
-    return undefined;
+  // GHL API format: "2026-04-12 18:00:00" — already UTC, parse as UTC explicitly.
+  if (/^\d{4}-\d{2}-\d{2}/.test(cleaned)) {
+    const normalized = cleaned.replace(" ", "T");
+    const hasOffset =
+      normalized.endsWith("Z") || /[+-]\d{2}:?\d{2}$/.test(normalized);
+    const d = new Date(hasOffset ? normalized : normalized + "Z");
+    return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
   }
 
-  return date.toISOString();
+  // GHL webhook format: "April 12, 2026 11:00 AM" — Pacific wall-clock time.
+  // Parse components manually (avoids new Date(string) local-timezone ambiguity),
+  // then find the UTC instant where America/Los_Angeles shows that same h:m.
+  const m = cleaned.match(/^(\w+)\s+(\d+),\s*(\d{4})\s+(\d+):(\d+)\s*(AM|PM)/i);
+  if (!m) return undefined;
+
+  const MONTHS = [
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+  ];
+  const month = MONTHS.indexOf(m[1].toLowerCase());
+  if (month === -1) return undefined;
+
+  const day = parseInt(m[2]);
+  const year = parseInt(m[3]);
+  let hour = parseInt(m[4]);
+  const minute = parseInt(m[5]);
+  const ampm = m[6].toUpperCase();
+  if (ampm === "PM" && hour !== 12) hour += 12;
+  if (ampm === "AM" && hour === 12) hour = 0;
+
+  // Start with a UTC candidate where UTC components = intended Pacific h:m.
+  // Iteratively shift until Pacific wall clock matches (handles DST correctly).
+  let candidate = new Date(Date.UTC(year, month, day, hour, minute, 0));
+
+  for (let i = 0; i < 3; i++) {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/Los_Angeles",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(candidate);
+    const pHour = parseInt(parts.find((p) => p.type === "hour")?.value ?? "0");
+    const pMin = parseInt(parts.find((p) => p.type === "minute")?.value ?? "0");
+    const diffMs = ((hour - pHour) * 60 + (minute - pMin)) * 60000;
+    if (diffMs === 0) break;
+    candidate = new Date(candidate.getTime() + diffMs);
+  }
+
+  return candidate.toISOString();
 }
 
 export async function findCase(email, phone) {
