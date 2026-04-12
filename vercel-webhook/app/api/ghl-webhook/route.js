@@ -204,10 +204,14 @@ export async function POST(request) {
       });
     }
 
+    // Canonical UTC ISO for dedup + task_logs (Pacific conversion happens only for IRS Logics API).
+    // Storing UTC in task_logs keeps dedup stable and makes time-range queries consistent.
+    const parsedStartUtc = parseGhlDate(normalized.appointmentStart) || normalized.appointmentStart;
+    const parsedEndUtc = parseGhlDate(normalized.appointmentEnd) || normalized.appointmentEnd || null;
+
     // DEDUP: Check if we already created a task for this case + appointment time
-    const parsedStartForDedup = parseGhlDate(normalized.appointmentStart) || normalized.appointmentStart;
-    if (await isDuplicateTask(caseId, parsedStartForDedup)) {
-      console.log(`Duplicate task detected for case ${caseId} at ${parsedStartForDedup} — skipping`);
+    if (await isDuplicateTask(caseId, parsedStartUtc)) {
+      console.log(`Duplicate task detected for case ${caseId} at ${parsedStartUtc} — skipping`);
       return NextResponse.json({
         success: true,
         duplicate: true,
@@ -270,8 +274,8 @@ export async function POST(request) {
         officerName: officer.name,
         officerUserId: officer.userId,
         assignmentMethod,
-        appointmentStart: taskDetails.dueDate,
-        appointmentEnd: taskDetails.endDate,
+        appointmentStart: parsedStartUtc,
+        appointmentEnd: parsedEndUtc,
         status: "task_failed",
         errorMessage: taskResult.errorMessage,
       });
@@ -303,8 +307,8 @@ export async function POST(request) {
       officerName: officer.name,
       officerUserId: officer.userId,
       assignmentMethod,
-      appointmentStart: taskDetails.dueDate,
-      appointmentEnd: taskDetails.endDate,
+      appointmentStart: parsedStartUtc,
+      appointmentEnd: parsedEndUtc,
       status: "success",
     });
 
@@ -328,8 +332,8 @@ export async function POST(request) {
       officerName: officer?.name,
       officerUserId: officer?.userId,
       assignmentMethod,
-      appointmentStart: taskDetails?.dueDate,
-      appointmentEnd: taskDetails?.endDate,
+      appointmentStart: parseGhlDate(normalized?.appointmentStart) || normalized?.appointmentStart,
+      appointmentEnd: parseGhlDate(normalized?.appointmentEnd) || normalized?.appointmentEnd || null,
       status: "error",
       errorMessage,
     });

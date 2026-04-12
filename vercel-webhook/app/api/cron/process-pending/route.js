@@ -200,6 +200,10 @@ async function processTaskFailed(row, results) {
 
   const taskResult = await createTask(taskPayload);
 
+  // Store UTC in task_logs for consistent dedup — Pacific is only for IRS Logics API.
+  const logStartUtc = parseGhlDate(normalized.appointmentStart) || normalized.appointmentStart;
+  const logEndUtc = parseGhlDate(normalized.appointmentEnd) || normalized.appointmentEnd || null;
+
   await insertTaskLog({
     ...normalized,
     caseId,
@@ -209,8 +213,8 @@ async function processTaskFailed(row, results) {
     officerName: officer.name,
     officerUserId: officer.userId,
     assignmentMethod,
-    appointmentStart: taskDetails.dueDate,
-    appointmentEnd: taskDetails.endDate,
+    appointmentStart: logStartUtc,
+    appointmentEnd: logEndUtc,
     status: taskResult.ok ? "success" : "task_failed",
     errorMessage: taskResult.errorMessage || null,
   });
@@ -367,6 +371,9 @@ async function processPendingQueue() {
 
       const taskResult = await createTask(taskPayload);
 
+      const queueLogStartUtc = parseGhlDate(normalized.appointmentStart) || normalized.appointmentStart;
+      const queueLogEndUtc = parseGhlDate(normalized.appointmentEnd) || normalized.appointmentEnd || null;
+
       await insertTaskLog({
         ...normalized,
         caseId,
@@ -376,8 +383,8 @@ async function processPendingQueue() {
         officerName: officer.name,
         officerUserId: officer.userId,
         assignmentMethod,
-        appointmentStart: taskDetails.dueDate,
-        appointmentEnd: taskDetails.endDate,
+        appointmentStart: queueLogStartUtc,
+        appointmentEnd: queueLogEndUtc,
         status: taskResult.ok ? "success" : "task_failed",
         errorMessage: taskResult.errorMessage || null,
       });
@@ -465,6 +472,9 @@ async function safetyNetSweep() {
 
         const taskResult = await createTask(taskPayload);
 
+        // Safety net already computed parsedStart above; reuse it for consistent UTC logging.
+        const netLogEndUtc = parseGhlDate(normalized.appointmentEnd) || normalized.appointmentEnd || null;
+
         await insertTaskLog({
           ...normalized,
           caseId: lookup.caseId,
@@ -474,8 +484,8 @@ async function safetyNetSweep() {
           officerName: officer.name,
           officerUserId: officer.userId,
           assignmentMethod,
-          appointmentStart: taskDetails.dueDate,
-          appointmentEnd: taskDetails.endDate,
+          appointmentStart: parsedStart,
+          appointmentEnd: netLogEndUtc,
           status: taskResult.ok ? "success" : "task_failed",
           errorMessage: taskResult.errorMessage || null,
         });
