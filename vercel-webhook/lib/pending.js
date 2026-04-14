@@ -161,3 +161,28 @@ export async function updatePendingTaskContactInfo(id, email, phone) {
     headers: { Prefer: "return=minimal" },
   });
 }
+
+/**
+ * Transition a pending row to missing_appointment after auto-creating its case
+ * (or after task_failed recovery loses its appointment data). Keeps the row in
+ * the retry loop until real appointment data is found — we never create tasks
+ * with fallback times.
+ */
+export async function transitionToMissingAppointment(id, { caseId, lookupMethod } = {}) {
+  const body = {
+    reason: "missing_appointment",
+    retry_count: 0,
+    status: "pending",
+    next_retry_at: null, // missing_appointment retries every cron cycle
+    error_message: null,
+    updated_at: new Date().toISOString(),
+  };
+  if (caseId !== undefined) body.case_id = caseId;
+  if (lookupMethod !== undefined) body.lookup_method = lookupMethod;
+
+  await supabaseRest(`pending_tasks?id=eq.${id}`, {
+    method: "PATCH",
+    body,
+    headers: { Prefer: "return=minimal" },
+  });
+}

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   buildCaseActivityDetails,
   buildTaskDetails,
+  canCreateTask,
   normalizeWebhookPayload,
   pickFirstValue,
   toPacificISO,
@@ -102,18 +103,39 @@ run("buildTaskDetails creates task subject, dates, and comments", () => {
   );
 });
 
-run("buildTaskDetails falls back to current time when appointment time missing", () => {
+run("buildTaskDetails returns null dueDate when appointment time missing — no fake fallback", () => {
   const details = buildTaskDetails({
     firstName: "Scott",
     lastName: "Stallard",
   });
 
+  // Subject falls back to contact name (no time suffix)
   assert.equal(details.subject, "Appointment: Scott Stallard");
-  assert.ok(details.dueDate.endsWith("Z"), "fallback dueDate must be UTC ISO with Z");
-  assert.equal(details.dueDate, details.reminder);
+
+  // Critical: dueDate MUST be null, not a fake processing-time fallback.
+  // This is the invariant that prevents wrong-time tasks in IRS Logics.
+  assert.equal(details.dueDate, null);
+  assert.equal(details.reminder, null);
   assert.equal(details.endDate, undefined);
-  assert.ok(details.comments.includes("⚠ No appointment time received"));
-  assert.ok(details.comments.includes("Check GHL Workflow"));
+
+  // The old "⚠ No appointment time received" warning line must be gone —
+  // we no longer emit tasks with bogus times, so the warning is obsolete.
+  if (details.comments) {
+    assert.ok(!details.comments.includes("⚠ No appointment time received"));
+    assert.ok(!details.comments.includes("defaulted to webhook processing time"));
+  }
+
+  // canCreateTask guard must reject this payload.
+  assert.equal(canCreateTask(details), false);
+});
+
+run("canCreateTask returns true only when dueDate is present", () => {
+  assert.equal(canCreateTask(null), false);
+  assert.equal(canCreateTask(undefined), false);
+  assert.equal(canCreateTask({}), false);
+  assert.equal(canCreateTask({ dueDate: null }), false);
+  assert.equal(canCreateTask({ dueDate: "" }), false);
+  assert.equal(canCreateTask({ dueDate: "2026-04-14T22:00:00.000Z" }), true);
 });
 
 run("buildCaseActivityDetails creates subject and comment for successful task logging", () => {

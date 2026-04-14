@@ -11,12 +11,13 @@ import {
   parseGhlDate,
 } from "@/lib/irs-logics";
 import { getNextOfficer, insertTaskLog } from "@/lib/supabase";
-import { buildTaskDetails } from "@/lib/webhook";
+import { buildTaskDetails, canCreateTask } from "@/lib/webhook";
 import {
   getPendingTasks,
   completePendingTask,
   incrementRetry,
   updatePendingTaskContactInfo,
+  transitionToMissingAppointment,
   MAX_CASE_NOT_FOUND_RETRIES,
   MAX_TASK_FAILED_RETRIES,
 } from "@/lib/pending";
@@ -41,11 +42,14 @@ function isAuthorized(request) {
  *   retry 0 (retry 1): basic findCase(email, phone)
  *   retry 1 (retry 2): + alt phone formats + GHL contact enrichment
  *   retry 2 (retry 3): + AI agent fuzzy match
- *   retry 3 (retry 4): auto-create the case
+ *   retry 3 (retry 4): auto-create the case (task only if appointment data present)
  *
- * Returns { caseId, lookupMethod, officer?, method? } or null (if retried/incremented).
+ * Returns:
+ *   - { caseId, lookupMethod, officer?, method? } — caller proceeds to task creation
+ *   - { deferred: true } — caller must continue (task creation postponed; row parked as missing_appointment)
+ *   - null — caller must continue (row already incrementRetry'd)
  */
-async function escalatingCaseSearch(row, results) {
+async function escalatingCaseSearch(row, results, { hasAppointment } = {}) {
   const retryNum = row.retry_count;
 
   // --- RETRY 1: basic email + phone ---
@@ -120,6 +124,21 @@ async function escalatingCaseSearch(row, results) {
 
     results.autoCreated++;
     console.log(`Pending #${row.id}: case auto-created with CaseID ${createResult.caseId}, officer ${officer.name}`);
+
+    // If appointment data is still missing, we must NOT create a task with a
+    // fake DueDate. Park the row as missing_appointment — the retry loop will
+    // keep trying GHL REST / MCP / Agent every cron cycle until real data
+    // arrives. The case is already created so subsequent cycles skip search.
+    if (!hasAppointment) {
+      console.log(`Pending #${row.id}: case ${createResult.caseId} created, but no appointment data — deferring task creation to missing_appointment retry loop`);
+      await transitionToMissingAppointment(row.id, {
+        caseId: createResult.caseId,
+        lookupMethod: "auto_created",
+      });
+      results.retried++;
+      return { deferred: true };
+    }
+
     return {
       caseId: createResult.caseId,
       lookupMethod: "auto_created",
@@ -148,6 +167,16 @@ async function processTaskFailed(row, results) {
       null
     );
     if (agentData.appointmentStart) Object.assign(ghlData, agentData);
+  }
+
+  // Never retry task creation without real appointment data — defer to the
+  // missing_appointment loop so we keep hunting for the real time instead of
+  // emitting a task with the webhook processing time.
+  if (!ghlData.appointmentStart) {
+    console.log(`Pending #${row.id}: task_failed retry has no appointment data — deferring to missing_appointment loop`);
+    await transitionToMissingAppointment(row.id, { caseId });
+    results.retried++;
+    return;
   }
 
   const parsedStart = parseGhlDate(ghlData.appointmentStart) || ghlData.appointmentStart;
@@ -184,6 +213,14 @@ async function processTaskFailed(row, results) {
   };
 
   const taskDetails = buildTaskDetails(normalized);
+
+  // Defense in depth — should never fire after the gate above
+  if (!canCreateTask(taskDetails)) {
+    console.error(`Pending #${row.id}: refusing to create task without real DueDate (task_failed path)`);
+    await transitionToMissingAppointment(row.id, { caseId });
+    results.retried++;
+    return;
+  }
 
   const taskPayload = {
     CaseID: caseId,
@@ -300,8 +337,10 @@ async function processPendingQueue() {
       let assignedMethod = null;
 
       if (!caseId) {
-        const searchResult = await escalatingCaseSearch(row, results);
+        const hasAppointment = Boolean(ghlData.appointmentStart);
+        const searchResult = await escalatingCaseSearch(row, results, { hasAppointment });
         if (!searchResult) continue; // escalatingCaseSearch already called incrementRetry
+        if (searchResult.deferred) continue; // auto-created case but no appointment data yet
         caseId = searchResult.caseId;
         lookupMethod = searchResult.lookupMethod;
         if (searchResult.officer) {
@@ -350,6 +389,15 @@ async function processPendingQueue() {
       }
 
       const taskDetails = buildTaskDetails(normalized);
+
+      // Defense in depth — should never fire because the gate above + the
+      // escalatingCaseSearch deferred branch handle missing appointment data.
+      if (!canCreateTask(taskDetails)) {
+        console.error(`Pending #${row.id}: refusing to create task without real DueDate (main queue path)`);
+        await transitionToMissingAppointment(row.id, { caseId, lookupMethod });
+        results.retried++;
+        continue;
+      }
 
       let comments = taskDetails.comments || "";
       if (assignmentMethod === "auto_created") {
@@ -454,6 +502,15 @@ async function safetyNetSweep() {
         };
 
         const taskDetails = buildTaskDetails(normalized);
+
+        // Defense in depth — safety net sources from GHL directly so dueDate
+        // should always be present, but if parsing ever fails we skip rather
+        // than send a null DueDate.
+        if (!canCreateTask(taskDetails)) {
+          console.error(`Safety net: refusing to create task without real DueDate (case ${lookup.caseId})`);
+          results.skipped++;
+          continue;
+        }
 
         const taskPayload = {
           CaseID: lookup.caseId,

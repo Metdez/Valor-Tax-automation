@@ -12,6 +12,7 @@ import { getNextOfficer, insertTaskLog } from "@/lib/supabase";
 import {
   buildCaseActivityDetails,
   buildTaskDetails,
+  canCreateTask,
   normalizeWebhookPayload,
 } from "@/lib/webhook";
 import { buildPendingEntry, insertPendingTask } from "@/lib/pending";
@@ -232,6 +233,31 @@ export async function POST(request) {
     }
 
     taskDetails = buildTaskDetails(normalized);
+
+    // Defense in depth — if parseGhlDate couldn't parse the raw string even
+    // though it was non-empty, defer to the pending queue rather than send a
+    // null DueDate (which IRS Logics rejects, and previously would have
+    // silently fallen back to the webhook processing time).
+    if (!canCreateTask(taskDetails)) {
+      console.error(`Webhook: refusing to create task with unparseable appointmentStart for case ${caseId}`);
+      const pendingEntry = buildPendingEntry(normalized, { caseId, lookupMethod, reason: "missing_appointment" });
+      await insertPendingTask(pendingEntry);
+
+      await safeInsertTaskLog({
+        ...normalized,
+        caseId,
+        lookupMethod,
+        status: "pending_appointment",
+        errorMessage: "Appointment time unparseable — queued for retry via cron",
+      });
+
+      return NextResponse.json({
+        success: true,
+        queued: true,
+        caseId,
+        message: "Appointment time unparseable — queued for processing.",
+      });
+    }
 
     const taskPayload = {
       CaseID: caseId,

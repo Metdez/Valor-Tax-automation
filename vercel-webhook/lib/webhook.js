@@ -102,12 +102,11 @@ export function buildTaskDetails(payload) {
   const parsedStart = parseGhlDate(payload.appointmentStart);
   const endDate = parseGhlDate(payload.appointmentEnd);
 
-  // IRS Logics requires DueDate — fall back to now if GHL didn't send the time.
-  // Send UTC ISO with Z directly — naive strings (no Z) are treated as UTC by
-  // IRS Logics, then shifted by the viewer's browser timezone (e.g. 11:00 UTC
-  // → 6:00 AM CDT). UTC with Z lets each user's browser show the correct time.
-  const hasTimes = Boolean(parsedStart);
-  const dueDate = parsedStart || new Date().toISOString();
+  // Hard invariant: tasks must have a real appointment time. If parsedStart is
+  // missing, dueDate/reminder are returned as null and callers MUST refuse to
+  // create the task — never fall back to processing time, which produces
+  // wrong-time tasks that officers act on. Use canCreateTask() to check.
+  const dueDate = parsedStart || null;
 
   // Build a human-readable time string for the subject line
   const readableStart = formatReadableDate(parsedStart || payload.appointmentStart);
@@ -124,9 +123,6 @@ export function buildTaskDetails(payload) {
     contactName ? `Contact: ${contactName}` : null,
     readableStart ? `Appointment Start: ${readableStart}` : null,
     readableEnd ? `Appointment End: ${readableEnd}` : null,
-    !hasTimes
-      ? "⚠ No appointment time received from GHL — due date defaulted to webhook processing time. Check GHL Workflow field mapping."
-      : null,
     payload.aiSummary ? `AI Summary: ${payload.aiSummary}` : null,
     payload.aiTranscript ? `Transcript: ${payload.aiTranscript}` : null,
   ]
@@ -140,6 +136,15 @@ export function buildTaskDetails(payload) {
     endDate: endDate || undefined,
     comments: comments || undefined,
   };
+}
+
+/**
+ * Guard for callers of buildTaskDetails: returns true only if the task has a
+ * real appointment time. If this returns false, the caller MUST NOT call
+ * createTask — defer to the pending_tasks retry loop instead.
+ */
+export function canCreateTask(taskDetails) {
+  return Boolean(taskDetails?.dueDate);
 }
 
 export function buildCaseActivityDetails(payload, context = {}) {
